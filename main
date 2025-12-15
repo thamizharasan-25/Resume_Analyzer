@@ -1,0 +1,218 @@
+# main.py - Updated with proper resume generation handling
+
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from fastapi.requests import Request
+from fastapi.responses import JSONResponse, FileResponse
+import os
+import json
+import asyncio
+from pathlib import Path
+from src.crew import ResumeAnalyzerCrew
+from src.knowledge.ai_ds_requirements import AI_DS_REQUIREMENTS
+
+app = FastAPI(title="Resume Analyzer & Enhancer")
+
+# Create directories if they don't exist
+directories = ["uploads", "outputs", "src/ui/static", "src/ui/templates"]
+for directory in directories:
+    Path(directory).mkdir(parents=True, exist_ok=True)
+
+# Mount static files and templates
+app.mount("/static", StaticFiles(directory="src/ui/static"), name="static")
+templates = Jinja2Templates(directory="src/ui/templates")
+
+# Store analysis results temporarily (in production, use proper session management)
+analysis_storage = {}
+
+@app.get("/")
+async def home(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+@app.post("/upload-resume")
+async def upload_resume(
+    file: UploadFile = File(...),
+    mode: str = Form(...)
+):
+    try:
+        print(f"📁 Uploading file: {file.filename}, mode: {mode}")
+        
+        # Validate file
+        if not file.filename.lower().endswith(('.pdf', '.docx')):
+            raise HTTPException(status_code=400, detail="Only PDF and DOCX files are supported")
+        
+        # Save uploaded file
+        file_path = f"uploads/{file.filename}"
+        with open(file_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+        
+        print(f"✅ File saved: {file_path}")
+        
+        # Initialize crew
+        crew = ResumeAnalyzerCrew()
+        
+        # Run analysis based on mode
+        print(f"🔍 Starting analysis in {mode} mode...")
+        if mode == "static":
+            result = await crew.analyze_with_static_knowledge(file_path)
+        else:
+            result = await crew.analyze_with_web_search(file_path)
+        
+        print(f"✅ Analysis completed for {file.filename}")
+        
+        # Store analysis result for later use
+        analysis_storage[file.filename] = {
+            'analysis': result,
+            'file_path': file_path
+        }
+        
+        return JSONResponse(content={
+            "status": "success",
+            "analysis": result,
+            "filename": file.filename
+        })
+        
+    except Exception as e:
+        print(f"❌ Error in upload_resume: {e}")
+        # Return a more detailed error for debugging
+        return JSONResponse(
+            status_code=500, 
+            content={
+                "status": "error",
+                "message": f"Analysis failed: {str(e)}",
+                "details": "Please check the file format and try again"
+            }
+        )
+
+@app.post("/generate-resume")
+async def generate_resume(request: Request):
+    try:
+        data = await request.json()
+        filename = data.get("filename")
+        improvements = data.get("improvements", [])
+        
+        print(f"🎯 Generating enhanced resume for: {filename}")
+        
+        if filename not in analysis_storage:
+            raise HTTPException(status_code=400, detail="Analysis data not found. Please analyze the resume first.")
+        
+        # Get stored analysis data
+        stored_data = analysis_storage[filename]
+        analysis_data = stored_data['analysis']
+        file_path = stored_data['file_path']
+        
+        # Add improvements to analysis data
+        analysis_data['improvements'] = improvements
+        
+        # Initialize crew and generate enhanced resume
+        crew = ResumeAnalyzerCrew()
+        output_filename = await crew.generate_enhanced_resume(file_path, analysis_data)
+        
+        if output_filename:
+            print(f"✅ Enhanced resume generated: {output_filename}")
+            return JSONResponse(content={
+                "status": "success",
+                "download_url": f"/download/{output_filename}",
+                "filename": output_filename
+            })
+        else:
+            raise Exception("Failed to generate enhanced resume")
+        
+    except Exception as e:
+        print(f"❌ Error in generate_resume: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error", 
+                "message": f"Resume generation failed: {str(e)}",
+                "details": "Please try again or contact support"
+            }
+        )
+
+@app.get("/download/{filename}")
+async def download_file(filename: str):
+    try:
+        file_path = f"outputs/{filename}"
+        print(f"📥 Download requested for: {file_path}")
+        
+        if os.path.exists(file_path):
+            # Check if file has content
+            file_size = os.path.getsize(file_path)
+            print(f"📄 File size: {file_size} bytes")
+            
+            if file_size < 100:  # File too small, might be empty
+                print("⚠️ File appears to be empty, regenerating...")
+                # Try to regenerate the file with sample content
+                from src.tools.file_tools import ResumeGenerator
+                generator = ResumeGenerator()
+                sample_content = generator._generate_sample_resume()
+                generator.generate_docx(sample_content, file_path)
+            
+            return FileResponse(
+                file_path,
+                media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                filename=filename,
+                headers={"Content-Disposition": f"attachment; filename={filename}"}
+            )
+        else:
+            print(f"❌ File not found: {file_path}")
+            raise HTTPException(status_code=404, detail="File not found")
+            
+    except Exception as e:
+        print(f"❌ Error in download: {e}")
+        raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "uploads_dir": os.path.exists("uploads"),
+        "outputs_dir": os.path.exists("outputs"),
+        "templates_dir": os.path.exists("src/ui/templates")
+    }
+
+@app.get("/debug/{filename}")
+async def debug_analysis(filename: str):
+    """Debug endpoint to check analysis data"""
+    if filename in analysis_storage:
+        return analysis_storage[filename]
+    else:
+        return {"error": "Analysis data not found", "available": list(analysis_storage.keys())}
+
+# Add cleanup endpoint for development
+@app.post("/cleanup")
+async def cleanup_files():
+    """Clean up uploaded and output files (development only)"""
+    try:
+        import shutil
+        
+        # Clean uploads
+        if os.path.exists("uploads"):
+            shutil.rmtree("uploads")
+            os.makedirs("uploads")
+        
+        # Clean outputs  
+        if os.path.exists("outputs"):
+            shutil.rmtree("outputs")
+            os.makedirs("outputs")
+        
+        # Clear analysis storage
+        analysis_storage.clear()
+        
+        return {"status": "success", "message": "Files cleaned up"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+if __name__ == "__main__":
+    print("🚀 Starting Resume Analyzer & Enhancer")
+    print("=" * 50)
+    print("📝 Access the application at: http://localhost:8000")
+    print("🔧 Debug endpoint: http://localhost:8000/health")
+    print("🛑 Press Ctrl+C to stop")
+    print("-" * 50)
+    
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
